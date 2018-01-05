@@ -21,12 +21,37 @@ class GaussianProb(Function):
     @staticmethod
     def forward(ctx, sample, means, stdvs):
         """Forward pass: compute a vector of gaussian probabilities."""
-        return None #TODO
+        # expand xd to appropriate shape:
+        ncomponents = means.size(0)
+        eps = 0.001
+        sample_d = sample.expand(sample.size(0), ncomponents)
+
+        # compute densities as batch:
+        variances = torch.pow(stdvs, 2).clamp(min=eps)
+        exponent = torch.exp(torch.pow(sample_d - means, 2).mul(-1.0) / (2 * variances))
+        multiplier = torch.reciprocal(torch.sqrt(variances.mul(2*math.pi)))
+        output = (multiplier * exponent)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backwards pass: derivative of gaussian density function w/r/t sample."""
-        return None #TODO
+        # get inputs and initialize all gradients to None:
+        sample, means, stdvs = ctx.saved_variables
+        grad_sample = grad_means = grad_stdvs = None
+        
+        # compute all gradients, making sure to account for effects of `grad_output`:
+        if ctx.needs_input_grad[0]:
+            # TODO
+            grad_sample = torch.ones(sample.size())
+        if ctx.needs_input_grad[1]:
+            # TODO
+            grad_means = torch.zeros(means.size())
+        if ctx.needs_input_grad[2]:
+            # TODO
+            grad_stdvs = torch.zeros(stdvs.size())
+
+        return grad_sample, grad_means, grad_stdvs
 
 
 class MixDenoise(nn.Module):
@@ -54,14 +79,15 @@ class MixDenoise(nn.Module):
 
         Returns:
         * a FloatTensor variable of shape (batch_size, ncomponents).
-
-        [[TODO: factor this out into an `autograd.Function` and implement below.]]
         """
+        return GaussianProb.apply(x, self.means, self.stdvs)
+
+        # DEPRECATED:
         # expand xd to appropriate shape:
-        xd = x.expand(x.size(0), self.ncomponents)
+        #xd = x.expand(x.size(0), self.ncomponents)
 
         # compute densities as batch:
-        variances = torch.pow(self.stdvs, 2).clamp(min=self.eps)
-        exponent = torch.exp(torch.pow(xd - self.means, 2).mul(-1.0) / (2 * variances))
-        multiplier = torch.reciprocal(torch.sqrt(variances.mul(2*math.pi)))
-        return (multiplier * exponent)
+        #variances = torch.pow(self.stdvs, 2).clamp(min=self.eps)
+        #exponent = torch.exp(torch.pow(xd - self.means, 2).mul(-1.0) / (2 * variances))
+        #multiplier = torch.reciprocal(torch.sqrt(variances.mul(2*math.pi)))
+        #return (multiplier * exponent)
