@@ -7,87 +7,119 @@ into corresponding probabilities from a series of learned gaussians.
 This module is useful if you have a value `x` coming from an unknown
 mixture of gaussians and want to split it into its components.
 
-(TODO: better description here)
+Credits:
+* Thanks to @hardmaru (https://github/com/hardmaru/pytorch_notebooks) for
+providing insight through publicly available code implementing the MDN loss function.
 """
 import math
 import torch
 import torch.nn as nn
-from torch.autograd import Function
-
-class GaussianProb(Function):
-    """
-    Implementation of a gaussian probability estimation function with custom backwards gradient-passing.
-    """
-    @staticmethod
-    def forward(ctx, sample, means, stdvs):
-        """Forward pass: compute a vector of gaussian probabilities."""
-        # expand xd to appropriate shape:
-        ncomponents = means.size(0)
-        eps = 0.001
-        sample_d = sample.expand(sample.size(0), ncomponents)
-
-        # compute densities as batch:
-        variances = torch.pow(stdvs, 2).clamp(min=eps)
-        exponent = torch.exp(torch.pow(sample_d - means, 2).mul(-1.0) / (2 * variances))
-        multiplier = torch.reciprocal(torch.sqrt(variances.mul(2*math.pi)))
-        output = (multiplier * exponent)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Backwards pass: derivative of gaussian density function w/r/t sample."""
-        # get inputs and initialize all gradients to None:
-        sample, means, stdvs = ctx.saved_variables
-        grad_sample = grad_means = grad_stdvs = None
-        
-        # compute all gradients, making sure to account for effects of `grad_output`:
-        if ctx.needs_input_grad[0]:
-            # TODO
-            grad_sample = torch.ones(sample.size())
-        if ctx.needs_input_grad[1]:
-            # TODO
-            grad_means = torch.zeros(means.size())
-        if ctx.needs_input_grad[2]:
-            # TODO
-            grad_stdvs = torch.zeros(stdvs.size())
-
-        return grad_sample, grad_means, grad_stdvs
+import torch.nn.functional as F
 
 
 class MixDenoise(nn.Module):
     """
-    (...)
+    The MixDenoise layer is essentially a container for the pi, mu, and sigma parameters
+    of a gaussian mixture model, which are evolved by backpropagation via a mixture density
+    loss function which optimizes the probability of a stream of inputs `x ~ GMM(unknown)`
+    coming from the parameters in here.
     """
-    def __init__(self, ncomponents, eps=0.001):
+    def __init__(self, num_components, jitter=0.01):
         """
-        (...)
+        Construct and initialize the parameters of a gaussian mixture model with specified
+        number of components. Note that we initialize the parameters using typical non-informative
+        priors: for K := num_components, we set the following initial probabilities:
+        * mixture coefficients are set to 1.0 (+/- jitter);
+        * mu values are set to 0.0 (+/- jitter);
+        * sigma values are set to 1.0 (+/- jitter).
         """
         super(MixDenoise, self).__init__()
-        self.ncomponents = ncomponents
-        self.eps = eps
-        # initialize means and stdvs:
-        self.means = nn.Parameter(torch.randn(ncomponents).mul(0.01), requires_grad=True)
-        self.stdvs = nn.Parameter(torch.rand(ncomponents).mul(0.01).add(1.0), requires_grad=True)
+
+        # save input arguments for future reference:
+        self.num_components = num_components
+        self.jitter = jitter
+        
+        # construct un-normalized model parameters:
+        _mixes = torch.ones(num_components).add_(torch.randn(num_components).mul_(jitter))
+        _means = torch.zeros(num_components).add_(torch.randn(num_components).mul_(jitter))
+        _stdvs = torch.ones(num_components).add_(torch.randn(num_components).mul_(jitter))
+
+        # wrap model parameters as nn.Parameter:
+        self.mixes = nn.Parameter(_mixes, requires_grad=True)
+        self.means = nn.Parameter(_means, requires_grad=True)
+        self.stdvs = nn.Parameter(_stdvs, requires_grad=True)
+
+    def gmm(self):
+        """
+        Return well-formed parameters; this method is intended to return normalized values
+        that represent a proper gaussian mixture model.
+
+        Returned values have `requires_grad == True`.
+        """
+        pi = F.softmax(self.mixes, dim=0)
+        mu = self.means
+        sigma = torch.exp(self.stdvs)
+        return (pi, mu, sigma)
+
+    def sample(self, size=1):
+        """
+        Return a random sample from the underlying gaussian mixture model.
+        
+        Returned values have `requires_grad == False`.
+        """
+        pi, mu, sigma = self.gmm()
+        choices = torch.multinomial(pi, size, replacement=True)
+        samples = torch.normal(mu[choices], sigma[choices])
+        return (choices, samples)
+
+    def activations(self, x):
+        """
+        Return a vector giving the probabilities of the sample `x` from each gaussian component.
+        Can accept `x` as either a scalar or a vector of batched scalar samples.
+        Returned values have `requires_grad == True`.
+        """
+        return gaussian_distribution(x, self.means, torch.exp(self.stdvs))
 
     def forward(self, x):
         """
-        For each component, compute the density function.
-
-        Args:
-        * x: a FloatTensor variable of shape (batch_size, 1); presumably sampled from a
-        mixture of gaussians.
-
-        Returns:
-        * a FloatTensor variable of shape (batch_size, ncomponents).
+        Compute the probability of `x` in the mixture defined by the underlying parameters.
         """
-        return GaussianProb.apply(x, self.means, self.stdvs)
+        pi, mu, sigma = self.gmm()
+        return torch.sum(gaussian_distribution(x, mu, sigma) * pi, dim=1)
 
-        # DEPRECATED:
-        # expand xd to appropriate shape:
-        #xd = x.expand(x.size(0), self.ncomponents)
 
-        # compute densities as batch:
-        #variances = torch.pow(self.stdvs, 2).clamp(min=self.eps)
-        #exponent = torch.exp(torch.pow(xd - self.means, 2).mul(-1.0) / (2 * variances))
-        #multiplier = torch.reciprocal(torch.sqrt(variances.mul(2*math.pi)))
-        #return (multiplier * exponent)
+# ==== helper functions:
+oneDivSqrtTwoPI = 1.0 / math.sqrt(2.0*math.pi) # normalisation factor for gaussian.
+def gaussian_distribution(ys, mu, sigma):
+    """
+    Compute gaussian density of vector ys ~ (batch_size,) against mu ~ (num_components,), sigma ~ (num_components,)
+    to get per-component probabilities ~ (batch_size, num_components).
+    """
+    # broadcast subtraction with mean and normalization to sigma
+    y_exp = ys.unsqueeze(1).expand(ys.size(0),mu.size(0))
+    mu_exp = mu.unsqueeze(0).expand(ys.size(0),mu.size(0))
+    sigma_exp = sigma.unsqueeze(0).expand(ys.size(0),mu.size(0))
+    result = (y_exp - mu_exp) * torch.reciprocal(sigma_exp)
+    result = - 0.5 * (result * result)
+    return (torch.exp(result) * torch.reciprocal(sigma_exp)) * oneDivSqrtTwoPI
+
+
+def mdn_loss(model_proba):
+    epsilon = 1e-8
+    return torch.mean(-1 * torch.log(epsilon + model_proba))
+
+
+def regularized_mdn_loss(mdn, sample):
+    epsilon = 1e-3
+    proba = mdn(sample)
+    raw_loss = torch.mean(-1 * torch.log(epsilon + torch.sum(proba, dim=1)))
+    l2_penalty = torch.norm(mdn.mixes,p=2) + torch.norm(mdn.means,p=2) + torch.norm(mdn.stdvs,p=2)
+    return (raw_loss + l2_penalty)
+
+
+def full_mdn_loss(out_pi, out_sigma, out_mu, y):
+    epsilon = 1e-3
+    result = gaussian_distribution(y, out_mu, out_sigma) * out_pi
+    result = torch.sum(result, dim=1)
+    result = - torch.log(epsilon + result)
+    return torch.mean(result)
