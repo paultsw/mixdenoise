@@ -10,6 +10,9 @@ mixture of gaussians and want to split it into its components.
 Credits:
 * Thanks to @hardmaru (https://github/com/hardmaru/pytorch_notebooks) for
 providing insight through publicly available code implementing the MDN loss function.
+The `gaussian_distribution` and `full_mdn_loss` functions below the MixDenoise
+class definition are modifications of functions that appear in:
+https://github.com/hardmaru/pytorch_notebooks/blob/master/mixtures_density_network_relu_version.ipynb
 """
 import math
 import torch
